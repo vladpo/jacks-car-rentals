@@ -1,6 +1,8 @@
 module CarRental ( solve
                  , Policy
                  , Values
+                 , solveValueIteration
+                 , ValueAction
                  ) where
 
   import Debug.Trace as T (trace)
@@ -16,6 +18,7 @@ module CarRental ( solve
   type Policy = Map (Int, Int) Int
   type Values = Map (Int, Int) Double
   type Distribution = Map Int ((Double, Double), (Double, Double))
+  type ValueAction = Map (Int, Int) (Int, Double)
 
   debug :: Show a => a -> a
   debug a | T.trace (show a) False = undefined
@@ -58,31 +61,35 @@ module CarRental ( solve
       reqRetPoisson l n = (poissonProb (lreq l) n, poissonProb (lret l) n)
 
   expectedReturn :: Values -> (Int, Int) -> Int -> [((Int, Int), (Int, Int))] -> Distribution -> Double
-  expectedReturn vs s a reqsRets d = 
-    if (c < 0 || c' < 0) then
-      -1.0
-    else
-      maybe (negate 1.0) id $ foldl (\sum reqRet -> (+) <$> sum <*> singleReturn reqRet) (Just 0.0) reqsRets
+  expectedReturn vs s a reqsRets d = foldl (\sum reqRet -> sum + singleReturn reqRet) 0.0 reqsRets
     where
       cost = -2 * abs a
       c = min (fst s - a) 20
       c' = min (snd s + a) 20
-      singleReturn :: ((Int, Int), (Int, Int)) -> Maybe Double
+      singleReturn :: ((Int, Int), (Int, Int)) -> Double
       singleReturn ((req, req'), (ret, ret'))
-        | c - req < 0 || c' -req' < 0 = Nothing
-        | otherwise                   = Just(probs*(r + 0.9*(vs ! (min (c - minreq + ret) 20, min (c' - minreq' + ret) 20))))
+        | c - req < 0 || c' -req' < 0 = 0.0
+        | otherwise                   = probs*(r + 0.9*(vs ! (min (c - minreq + ret) 20, min (c' - minreq' + ret) 20)))
           where
             (minreq, minreq') = (min c req, min c' req')
-            probs = (fst.fst $ d ! minreq)*(fst.snd $ d ! minreq')*(snd.fst $ d ! ret)*(snd.snd $ d ! ret')
+            probs = (fst.fst $ d ! minreq)*(snd.fst $ d ! minreq')*(fst.snd $ d ! ret)*(fst.snd $ d ! ret')
             r = fromIntegral(cost + 10*(minreq + minreq'))
 
   policyImprove :: Policy -> Values -> [((Int, Int), (Int, Int))] -> Distribution -> Policy
   policyImprove p vs reqsRets d = debug(mapWithKey (\s a -> bestAction s) p)
     where
-      bestAction s = fst (foldl compare (negate 5, expectedReturn vs s (negate 5) reqsRets d) [negate 4..5])
+      bestAction s = fst (foldl compare (0, 0.0) [negate 4..5])
         where 
           compare :: (Int, Double) -> Int -> (Int, Double)
-          compare (ba, er) a = let newEr = expectedReturn vs s a reqsRets d in if newEr > er then (a, newEr) else (ba, er)
+          compare (ba, er) a = 
+            let 
+              c = min (fst s - a) 20
+              c' = min (snd s + a) 20
+            in 
+              if (c < 0 || c' < 0) then
+                (ba, er)
+              else
+                let newEr = expectedReturn vs s a reqsRets d in if newEr > er then (a, newEr) else (ba, er)
       
 
   policyEvaluation :: Policy -> Values -> [((Int, Int), (Int, Int))] -> Distribution -> Values
@@ -101,3 +108,32 @@ module CarRental ( solve
 
   solve :: (Policy, Values)
   solve = learn (initPolicy, initValues) (pairs 11) initDist
+
+  initValueActions :: ValueAction 
+  initValueActions = initMap [0..20] $ const (0, 0.0)
+
+  valueIteration :: ValueAction -> [((Int, Int), (Int, Int))] -> Distribution -> ValueAction
+  valueIteration vas reqsRets d = mapWithKey (\s (oa, v) -> foldl argmax (0, 0.0) $ map (\a -> fmap (\s' -> (a, sum $ map (\t -> let p = prob t in  p*(cost a + return s' t + 0.9* value s' t)) reqsRets)) $ move s a) [negate 5..5]) vas
+    where 
+      move :: (Int, Int) -> Int -> Maybe (Int, Int)
+      move (c, c') a = if c - a >= 0 && c' + a >= 0 then Just (min (c-a) 20, min (c'+a) 20) else Nothing
+      value :: (Int, Int) -> ((Int, Int), (Int, Int)) -> Double
+      value (c, c') ((req, req'), (ret, ret')) = if c - req + ret < 0 || c' - req' + ret' < 0 then 0.0 else snd $ vas ! (min (c - req + ret) 20, min(c' - req' + ret') 20)
+      cost a = fromIntegral $ negate 2 * abs a
+      return :: (Int, Int) -> ((Int, Int), (Int, Int)) -> Double
+      return (c, c') ((req, req'), (ret, ret')) = if c >= req && c' >= req' then fromIntegral(10 * (req + req')) else 0.0
+      prob :: ((Int, Int), (Int, Int)) -> Double
+      prob ((req, req'), (ret, ret')) = (fst.fst $ d ! req) * (snd.fst $ d ! req') * (fst.snd $ d ! ret) * (snd.snd $ d ! ret')
+      argmax :: (Int, Double) -> Maybe (Int, Double) -> (Int, Double)
+      argmax (a, er) (Just (a', er')) = if er' > er then (a', er') else (a, er)
+      argmax t Nothing = t
+
+  learnVi :: ValueAction -> [((Int, Int), (Int, Int))] -> Distribution -> ValueAction
+  learnVi vas reqsRets d = if totalDiff <= 0.0001 || policyUnchanged then nvas else learnVi nvas reqsRets d
+    where 
+      nvas = valueIteration vas reqsRets d
+      totalDiff = debug(foldlWithKey (\diff s t -> diff + abs(snd t - (snd $ vas!s))) 0.0 nvas)
+      policyUnchanged = foldlWithKey (\b s t -> b && fst t == (fst $ vas!s)) True nvas
+
+  solveValueIteration :: ValueAction
+  solveValueIteration = learnVi initValueActions (pairs 11) initDist
